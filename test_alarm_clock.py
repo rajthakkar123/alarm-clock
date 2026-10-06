@@ -9,6 +9,7 @@ from alarm_clock import (
     AlarmClock,
     _load_alarms,
     _persist_alarms,
+    _apply_keyboard_action,
     handle_command,
     next_occurrence,
     parse_days,
@@ -49,6 +50,22 @@ class AlarmClockTests(unittest.TestCase):
         self.assertEqual(clock.tick(alarm.next_fire), alarm)
         self.assertTrue(clock.snooze(alarm.next_fire))
         self.assertIsNone(clock.tick(alarm.next_fire + timedelta(minutes=5) - timedelta(seconds=1)))
+        self.assertEqual(clock.tick(alarm.next_fire + timedelta(minutes=5)), alarm)
+
+    def test_keyboard_stop_dismisses_active_alarm(self):
+        clock = AlarmClock()
+        now = datetime(2026, 10, 6, 8, 0)
+        alarm = clock.add(8, 1, None, now)
+        clock.tick(alarm.next_fire)
+        self.assertEqual(_apply_keyboard_action(clock, "stop", alarm.next_fire), "Alarm stopped.")
+        self.assertIsNone(clock.active)
+
+    def test_keyboard_snooze_uses_five_minute_delay(self):
+        clock = AlarmClock()
+        now = datetime(2026, 10, 6, 8, 0)
+        alarm = clock.add(8, 1, None, now)
+        clock.tick(alarm.next_fire)
+        self.assertEqual(_apply_keyboard_action(clock, "snooze", alarm.next_fire), "Snoozed for 5 minutes.")
         self.assertEqual(clock.tick(alarm.next_fire + timedelta(minutes=5)), alarm)
 
     def test_invalid_time_is_rejected_cleanly(self):

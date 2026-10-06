@@ -19,7 +19,7 @@ from typing import Optional
 DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 DAY_INDEX = {name: index for index, name in enumerate(DAYS)}
 SNOOZE_MINUTES = 5
-PROMPT_ROW = 13
+PROMPT_ROW = 14
 
 
 @dataclass
@@ -155,7 +155,101 @@ class Ringer:
             self._stop_event.wait(0.5)
 
 
-def render_screen(now: datetime, clock: AlarmClock, notice: str) -> list[str]:
+class GlobalKeyboardControls:
+    """Windows-wide keyboard controls for the detached alarm worker."""
+
+    def __init__(self, clock: AlarmClock) -> None:
+        self.clock = clock
+        self._actions: queue.Queue[str] = queue.Queue()
+        self._user32 = None
+        self._hook = None
+        self._callback = None
+        self._event_type = None
+        self.label = "Global keyboard controls unavailable on this platform."
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class KeyboardEvent(ctypes.Structure):
+                _fields_ = [
+                    ("vkCode", wintypes.DWORD),
+                    ("scanCode", wintypes.DWORD),
+                    ("flags", wintypes.DWORD),
+                    ("time", wintypes.DWORD),
+                    ("dwExtraInfo", ctypes.c_size_t),
+                ]
+
+            callback_type = ctypes.WINFUNCTYPE(
+                ctypes.c_ssize_t, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM
+            )
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            user32.SetWindowsHookExW.argtypes = (
+                ctypes.c_int, callback_type, wintypes.HINSTANCE, wintypes.DWORD
+            )
+            user32.SetWindowsHookExW.restype = wintypes.HANDLE
+            user32.CallNextHookEx.argtypes = (
+                wintypes.HANDLE, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM
+            )
+            user32.CallNextHookEx.restype = ctypes.c_ssize_t
+            user32.UnhookWindowsHookEx.argtypes = (wintypes.HANDLE,)
+            user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+            user32.PeekMessageW.argtypes = (
+                ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT,
+                wintypes.UINT, wintypes.UINT
+            )
+            user32.PeekMessageW.restype = wintypes.BOOL
+            user32.TranslateMessage.argtypes = (ctypes.POINTER(wintypes.MSG),)
+            user32.DispatchMessageW.argtypes = (ctypes.POINTER(wintypes.MSG),)
+            user32.GetAsyncKeyState.argtypes = (ctypes.c_int,)
+            user32.GetAsyncKeyState.restype = ctypes.c_short
+            self._event_type = KeyboardEvent
+            self._user32 = user32
+            self._callback = callback_type(self._on_key)
+            self._hook = user32.SetWindowsHookExW(13, self._callback, None, 0)  # WH_KEYBOARD_LL
+            if self._hook:
+                self.label = "Any key stops · Ctrl+Alt+S snoozes"
+            else:
+                self.label = "Global key hook unavailable; use the CLI commands."
+        except (AttributeError, OSError, TypeError):
+            self.label = "Global key hook unavailable; use the CLI commands."
+
+    def _on_key(self, code: int, message: int, details: int) -> int:
+        import ctypes
+
+        if code >= 0 and message in (0x0100, 0x0104) and self.clock.active is not None:
+            key = ctypes.cast(details, ctypes.POINTER(self._event_type)).contents.vkCode
+            # Ignore modifier-only presses so Ctrl+Alt+S can be used to snooze.
+            if key not in (0x10, 0x11, 0x12, 0x5B, 0x5C):
+                ctrl = self._user32.GetAsyncKeyState(0x11) & 0x8000
+                alt = self._user32.GetAsyncKeyState(0x12) & 0x8000
+                self._actions.put("snooze" if ctrl and alt and key == ord("S") else "stop")
+        return self._user32.CallNextHookEx(self._hook, code, message, details)
+
+    def poll(self) -> list[str]:
+        if self._user32 is not None and self._hook:
+            import ctypes
+            from ctypes import wintypes
+
+            message = wintypes.MSG()
+            while self._user32.PeekMessageW(ctypes.byref(message), None, 0, 0, 1):
+                self._user32.TranslateMessage(ctypes.byref(message))
+                self._user32.DispatchMessageW(ctypes.byref(message))
+        actions = []
+        while True:
+            try:
+                actions.append(self._actions.get_nowait())
+            except queue.Empty:
+                return actions
+
+    def close(self) -> None:
+        if self._user32 is not None and self._hook:
+            self._user32.UnhookWindowsHookEx(self._hook)
+            self._hook = None
+
+
+def render_screen(now: datetime, clock: AlarmClock, notice: str, keyboard_controls: str = "") -> list[str]:
     """Build a consistent, centered terminal screen for the live clock."""
     width = 40
     border_top = "┌" + "─" * width + "┐"
@@ -176,6 +270,8 @@ def render_screen(now: datetime, clock: AlarmClock, notice: str) -> list[str]:
     else:
         schedule_line = "No upcoming alarms"
     lines.extend((schedule_line, "", "Commands: add | list | delete | snooze | stop | help | quit"))
+    if keyboard_controls:
+        lines.append(keyboard_controls)
     return lines
 
 
@@ -311,6 +407,12 @@ def _send_background_command(command: str, command_id: Optional[str] = None) -> 
     return command_id
 
 
+def _apply_keyboard_action(clock: AlarmClock, action: str, now: datetime) -> str:
+    if action == "snooze":
+        return f"Snoozed for {SNOOZE_MINUTES} minutes." if clock.snooze(now) else "No alarm is ringing."
+    return "Alarm stopped." if clock.stop() else "No alarm is ringing."
+
+
 def _start_background() -> None:
     data_dir = _data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -343,6 +445,7 @@ def run_daemon() -> None:
         clock = AlarmClock()
         _load_alarms(clock)
         ringer = Ringer()
+        keyboard = GlobalKeyboardControls(clock)
         notice = "Background alarm service is running."
         last_second: Optional[datetime] = None
         last_command_id: Optional[str] = None
@@ -360,6 +463,7 @@ def run_daemon() -> None:
                         "active": None,
                         "notice": notice,
                         "last_command_id": command_id,
+                        "keyboard_controls": keyboard.label,
                     })
                     return
                 notice = handle_command(line, clock, now)
@@ -371,6 +475,8 @@ def run_daemon() -> None:
             if due is not None:
                 notice = f"ALARM {_format_alarm(due)} — type snooze or stop"
                 _persist_alarms(clock)
+            for action in keyboard.poll():
+                notice = _apply_keyboard_action(clock, action, now)
             if clock.active is None:
                 ringer.stop()
             else:
@@ -381,12 +487,15 @@ def run_daemon() -> None:
                     "active": _format_alarm(clock.active) if clock.active else None,
                     "notice": notice,
                     "last_command_id": last_command_id,
+                    "keyboard_controls": keyboard.label,
                 })
                 last_second = now
             time.sleep(0.2)
     finally:
         if "ringer" in locals():
             ringer.stop()
+        if "keyboard" in locals():
+            keyboard.close()
         try:
             lock_path.unlink()
         except OSError:
@@ -404,7 +513,7 @@ def handle_command(line: str, clock: AlarmClock, now: datetime) -> str:
         return "Enter a command, or type help."
     command = parts[0].lower()
     if command == "help":
-        return "Commands: add HH:MM [once|mon,tue,...], list, delete ID, snooze, stop, quit"
+        return "Commands: add/list/delete, snooze/stop, quit. During ringing: Ctrl+Alt+S snoozes; any other key stops."
     if command == "add":
         if len(parts) not in (2, 3):
             return "Usage: add HH:MM [once|mon,tue,...]"
@@ -449,7 +558,15 @@ def _read_commands(commands: queue.Queue[str]) -> None:
             return
 
 
-def run() -> None:
+def _configure_terminal_output() -> None:
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
+
+
+def _run_background_controller() -> None:
+    _configure_terminal_output()
     _start_background()
     commands: queue.Queue[str] = queue.Queue()
     notice = "Background alarm service ready. Type help for commands."
@@ -478,7 +595,10 @@ def run() -> None:
                 pending_command_id = _send_background_command(line)
                 notice = "Sending command to background alarm service..."
             if last_second is None or now.second != last_second.second or now.date() != last_second.date():
-                lines = render_screen(now, _clock_from_status(status), notice)
+                lines = render_screen(
+                    now, _clock_from_status(status), notice,
+                    status.get("keyboard_controls", ""),
+                )
                 # Save the command prompt cursor, repaint only the clock area, then restore it.
                 print("\033[s\033[H" + "\n".join(line.ljust(80) + "\033[K" for line in lines)
                       + "\033[u", end="", flush=True)
@@ -487,6 +607,49 @@ def run() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        print("\033[?25h\nGoodbye.", flush=True)
+
+
+def run_foreground() -> None:
+    """Run the complete clock in this process without starting a worker."""
+    _configure_terminal_output()
+    clock = AlarmClock()
+    ringer = Ringer()
+    commands: queue.Queue[str] = queue.Queue()
+    notice = "Foreground mode: alarms stop when this program exits."
+    last_second: Optional[datetime] = None
+    print(f"\033[2J\033[{PROMPT_ROW};1H", end="", flush=True)
+    reader = threading.Thread(target=_read_commands, args=(commands,), daemon=True)
+    reader.start()
+    try:
+        while True:
+            now = datetime.now()
+            due = clock.tick(now)
+            if due is not None:
+                notice = f"ALARM {_format_alarm(due)} — type snooze or stop"
+            while True:
+                try:
+                    line = commands.get_nowait()
+                except queue.Empty:
+                    break
+                message = handle_command(line, clock, now)
+                if message == "quit":
+                    return
+                notice = message
+            if clock.active is None:
+                ringer.stop()
+            else:
+                ringer.start()
+            if last_second is None or now.second != last_second.second or now.date() != last_second.date():
+                lines = render_screen(now, clock, notice, "Foreground only · alarms stop on exit")
+                print("\033[s\033[H" + "\n".join(line.ljust(80) + "\033[K" for line in lines)
+                      + "\033[u", end="", flush=True)
+                last_second = now
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        ringer.stop()
         print("\033[?25h\nGoodbye.", flush=True)
 
 
@@ -509,5 +672,7 @@ if __name__ == "__main__":
         run_daemon()
     elif sys.argv[1:] == ["--stop-background"]:
         stop_background()
+    elif sys.argv[1:] == ["--background"]:
+        _run_background_controller()
     else:
-        run()
+        run_foreground()
